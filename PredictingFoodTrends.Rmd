@@ -1,0 +1,558 @@
+---
+title: "Predicting Food Trends with Google Search Data"
+author: "Parsa Vetry"
+date: "2026-08-15"
+output: pdf_document
+---
+
+# Introduction
+
+Food trends move quickly, a dish can go from niche to viral in the span of a month or two. This project asks the question: can Google search interest data anticipate which foods are about to grow in popularity?
+
+To explore this question, I pulled six years of Google Search Trends data from 2019 to 2026 for about 200 food and beverages. From each keyword's search data, I engineered a set of features meant to predict whether or not a food trend will grow.
+
+My first approach was to predict the exact search-interest level six months into the future, which turned out to be the wrong framing. My strongest model achieved an R-squared of about 0.74, while a naive model assuming that nothing changes achieved an R-squared value of .66; search interest is highly persistent month to month.
+
+I then reframed my problem as a binary question: will a keyword's search interest be higher, on average, six months from now than it is today? My direction based approach carried real signal, as opposed to the level-prediction approach. My best model achieved a strong AUC of .86, as opposed to the naive baseline of 0.5.
+
+
+# Data Collection
+
+```{r}
+library(gtrendsR)
+library(ggplot2)
+library(lubridate)
+library(dplyr)
+library(tidyr)
+library(zoo)
+```
+
+
+```{r}
+keywords <- c("matcha", "oat milk", "kombucha", "boba", "birria", "tacos", "empanadas", "tahini", "hot honey", "chili crisp", "cottage cheese", "kimchi", "gochujang", "ube", "mochi", "sushi", "ramen", "pho", "poke", "bao", "sourdough", "focaccia", "croissant", "bagels", "churros", "tiramisu", "basque cheesecake", "tres leches", "banana pudding", "baklava", "acai bowl", "smoothie bowl", "chia", "protein bowls", "cauliflower rice", "sweet potato", "avocado toast", "truffle fries", "loaded fries", "elote", "quesabirria", "street corn", "dalgona coffee", "cold brew", "dirty soda", "probiotic soda", "sparkling water", "creatine", "smash burger", "dubai chocolate", "protein shake", "granola", "greek yogurt", "skyr", "kefir", "dragon fruit", "mango sticky rice", "coconut water", "aloe vera", "chai latte", "dirty chai", "horchata", "agua fresca", "mexican hot chocolate", "marshmallow", "carrot cake", "apple", "red velvet cake", "cheesecake", "brownies", "cookies", "cinnamon rolls", "banana bread", "zucchini bread", "pumpkin bread", "paratha", "roti", "pita", "hummus", "falafel", "shawarma", "gyro", "kebab", "chicken tikka", "butter chicken", "palak paneer", "korean fried chicken", "fried chicken", "chicken sandwich", "grilled cheese", "philly cheesesteak", "corn dog", "hot dog", "sloppy joe", "meatballs", "lasagna", "mac and cheese", "baked ziti", "gnocchi", "risotto", "carbonara", "pesto", "bruschetta", "caprese", "greek salad", "caesar salad", "cobb salad", "spring rolls", "dumplings", "wontons", "fried rice", "pad thai", "chicken and waffles", "thai tea", "viet coffee", "taro", "black sesame", "yuzu", "chocolate chip cookies", "sugar cookies", "oreo", "brown butter cookies", "brookie", "cookie dough", "cake pops", "cupcakes", "donuts", "mochi donuts", "cronut", "cream puff", "eclair", "macaron", "profiterole", "cannoli", "gelato", "affogato", "panna cotta", "creme brulee", "flan", "rice pudding", "bread pudding", "sticky toffee pudding", "key lime pie", "pecan pie", "pumpkin pie", "apple pie", "fruit tart", "lemon tart", "chocolate mousse", "chocolate lava cake", "molten cake", "teriyaki", "yakitori", "katsu", "chicken katsu", "tonkatsu", "katsu sandwich", "udon", "soba", "yakisoba", "okonomiyaki", "takoyaki", "onigiri", "musubi", "spam musubi", "donburi", "gyudon", "oyakodon", "japanese curry", "curry rice", "chow mein", "lo mein", "mapo tofu", "orange chicken", "kung pao chicken", "general tso chicken", "beef and broccoli", "dim sum", "scallion pancakes", "hot pot", "szechuan", "korean barbecue", "bibimbap", "bulgogi", "club sandwich", "turkey sandwich", "tuna melt", "patty melt", "cheeseburger", "double cheeseburger", "bacon burger", "onion rings", "mozzarella sticks", "loaded nachos", "nachos", "quesadilla", "tostada", "enchiladas", "tamales", "pozole", "birria tacos", "fish tacos", "carne asada", "carne asada fries", "burrito", "breakfast burrito", "california burrito", "chimichanga", "sunflower seeds", "collagen", "electrolytes", "superfood", "spirulina", "turmeric", "ginger shots", "beet juice", "celery juice", "green juice", "bone broth", "mushroom coffee", "adaptogen", "ashwagandha", "pitaya", "papaya", "guava", "passion fruit", "pizza")
+
+```
+
+
+Create dataset from keywords
+```{r, eval = FALSE}
+dir.create("trends_raw_cache", showWarnings = FALSE)
+
+get_trend_raw <- function(kw) {
+  
+  file <- paste0("trends_raw_cache/", gsub(" ", "_", kw), ".rds")
+  
+  if (file.exists(file)) {
+    return(readRDS(file))
+  }
+  
+  Sys.sleep(runif(1, 155, 205))
+  
+  result <- tryCatch({
+    
+    gtrends(
+      kw,
+      geo = "US",
+      time = "2019-01-01 2026-08-14"
+    )$interest_over_time %>%
+      mutate(
+        date = as.Date(date),
+        hits = as.numeric(gsub("<1", "0.5", hits))
+      ) %>%
+      select(date, hits) %>%
+      mutate(keyword = kw)
+    
+  }, error = function(e) {
+    message("Failed: ", kw)
+    NULL
+  })
+  
+  if (!is.null(result)) {
+    saveRDS(result, file)
+  }
+  
+  result
+}
+
+all_trends_raw <- bind_rows(lapply(keywords, get_trend_raw))
+
+saveRDS(all_trends_raw, "food_trends_raw.rds")
+```
+
+```{r}
+all_trends_raw <- readRDS("food_trends_raw.rds")
+```
+
+# Feature Engineering
+
+```{r}
+epsilon <- 0.01
+
+features <- all_trends_raw %>%
+  group_by(keyword) %>%
+  arrange(date) %>%
+  mutate(
+    growth_3m = ifelse(lag(hits, 3) == 0, 0, (hits / lag(hits, 3)) - 1),
+    growth_6m = ifelse(lag(hits, 6) == 0, 0, (hits / lag(hits, 6)) - 1),
+    growth_12m = ifelse(lag(hits, 12) == 0, 0, (hits / lag(hits, 12)) - 1),
+    mean_3m = rollapply(hits, 3, mean, fill = NA, align = "right"),
+    mean_6m = rollapply(hits, 6, mean, fill = NA, align = "right"),
+    mean_12m = rollapply(hits, 12, mean, fill = NA, align = "right"),
+    mean_ratio_3m_12m = mean_3m / (mean_12m + epsilon),
+    slope_3m = rollapply(hits, 3, function(x) coef(lm(x ~ seq_along(x)))[2], fill = NA, align = "right"),
+    slope_6m = rollapply(hits, 6, function(x) coef(lm(x ~ seq_along(x)))[2], fill = NA, align = "right"),
+    slope_12m = rollapply(hits, 12, function(x) coef(lm(x ~ seq_along(x)))[2], fill = NA, align = "right"),
+    acceleration_3m = slope_3m - lag(slope_3m),
+    acceleration_6m = slope_6m - lag(slope_6m),
+    acceleration_12m = slope_12m - lag(slope_12m),
+    volatility_3m = rollapply(hits, 3, sd, fill = NA, align = "right"),
+    volatility_6m = rollapply(hits, 6, sd, fill = NA, align = "right"),
+    volatility_12m = rollapply(hits, 12, sd, fill = NA, align = "right"),
+    future_mean_6m = rollapply(lead(hits, 1), 6, mean, fill = NA, align = "left"),
+    future_mean_12m = rollapply(lead(hits, 1), 12, mean, fill = NA, align = "left"),
+    future_growth_6m = (future_mean_6m + epsilon) / (mean_6m + epsilon) - 1,
+    future_6m = lead(hits, 6),
+    max_12m = rollapply(hits, 12, max, align = "right", fill = NA, na.rm = TRUE),
+    breakout_12m = ifelse(hits > lag(max_12m), 1, 0), 
+    drawdown = hits / max_12m - 1,
+    monthly_change = hits - lag(hits),
+    trend_strength = abs(slope_12m) / (volatility_12m + epsilon),
+  direction = factor(ifelse(future_mean_6m > mean_6m, 1, 0), levels = c(0,1))
+  )%>%
+  ungroup() %>%
+  filter(
+    !is.na(growth_3m),
+    !is.na(growth_6m),
+    !is.na(growth_12m),
+    !is.na(mean_3m),
+    !is.na(mean_6m),
+    !is.na(mean_12m),
+    !is.na(mean_ratio_3m_12m),
+    !is.na(slope_3m),
+    !is.na(slope_6m),
+    !is.na(slope_12m),
+    !is.na(acceleration_3m),
+    !is.na(acceleration_6m),
+    !is.na(acceleration_12m),
+    !is.na(volatility_3m),
+    !is.na(volatility_6m),
+    !is.na(volatility_12m),
+    !is.na(future_mean_6m),
+    !is.na(future_mean_12m),
+    !is.na(future_growth_6m),
+    !is.na(future_6m),
+    !is.na(max_12m),
+    !is.na(breakout_12m),
+    !is.na(drawdown),
+    !is.na(monthly_change),
+    !is.na(trend_strength),
+    !is.na(direction)
+  )
+```
+
+# Predicting Future Search Volume
+
+We will split by time to avoid look-ahead bias
+```{r}
+# Split the training and test data
+set.seed(123)
+
+cutoff_date <- as.Date("2025-01-01")
+test_end <- as.Date("2026-06-01")
+
+train <- features %>% filter(date < cutoff_date)
+test <- features %>% filter(date >= cutoff_date & date < test_end)
+
+```
+
+
+## Ranger
+```{r}
+library(ranger)
+library(mlr3)
+library(mlr3learners)
+
+features_to_use <- c(
+  "growth_12m",
+  "mean_ratio_3m_12m",
+  "acceleration_3m",
+  "acceleration_12m",
+  "volatility_3m",
+  "volatility_12m",
+  "drawdown",
+  "monthly_change",
+  "trend_strength",
+  "acceleration_6m",
+  "volatility_6m"
+)
+
+task <- as_task_regr(train, target = "future_mean_6m", id = "all_trends_raw")
+
+task$select(features_to_use)
+
+learner_ranger <- lrn("regr.ranger", importance = "impurity")
+
+learner_ranger$train(task)
+
+learner_ranger$importance()
+
+prediction_ranger <- learner_ranger$predict_newdata(test)
+```
+
+```{r}
+current_level <- test$hits
+
+results_ranger <- test %>%
+  select(keyword, date, hits, future_mean_6m) %>%
+  mutate(
+    predicted_6m = prediction_ranger$response,
+    predicted_growth = (((predicted_6m + epsilon) / (current_level + epsilon)) - 1) * 100,
+    actual_growth = ifelse(hits <= epsilon, NA, (future_mean_6m / hits) - 1),
+    actual_growth_pct = actual_growth * 100,
+    error = predicted_6m - future_mean_6m,
+    absolute_error = abs(error),
+    percent_error = ifelse(future_mean_6m <= epsilon, NA, (predicted_6m - future_mean_6m) / future_mean_6m * 100)
+  )
+
+head(results_ranger)
+```
+
+
+```{r}
+mean(results_ranger$absolute_error)
+```
+
+
+## XGboost
+```{r}
+library(xgboost)
+library(mlr3)
+library(mlr3learners)
+
+features_to_use <- c(
+  "growth_12m",
+  "mean_ratio_3m_12m",
+  "acceleration_3m",
+  "acceleration_12m",
+  "volatility_3m",
+  "volatility_12m",
+  "drawdown",
+  "monthly_change",
+  "trend_strength",
+  "acceleration_6m",
+  "volatility_6m"
+)
+
+task <- as_task_regr(train, target = "future_mean_6m", id = "all_trends_raw")
+
+task$select(features_to_use)
+
+learner_xgboost <- lrn("regr.xgboost")
+
+
+learner_xgboost$train(task)
+
+prediction_xgboost <- learner_xgboost$predict_newdata(test)
+
+learner_xgboost$importance()
+
+
+```
+```{r}
+prediction_xgboost$score(msrs(c("regr.rmse","regr.mae","regr.rsq")))
+```
+
+
+```{r}
+current_level <- test$hits
+
+results_xgboost <- test %>%
+  select(keyword, date, hits, future_mean_6m) %>%
+  mutate(
+    predicted_6m = prediction_xgboost$response,
+    predicted_growth = (((predicted_6m + epsilon) / (current_level + epsilon)) - 1) * 100,
+    actual_growth = ifelse(hits <= epsilon, NA, (future_mean_6m / hits) - 1),
+    actual_growth_pct = actual_growth * 100,
+    error = predicted_6m - future_mean_6m,
+    absolute_error = abs(error),
+    percent_error = ifelse(future_mean_6m <= epsilon, NA, (predicted_6m - future_mean_6m) / future_mean_6m * 100)
+  )
+
+head(results_xgboost)
+```
+
+```{r}
+mean(results_xgboost$absolute_error)
+```
+
+# Establishing a Naive Baseline + Model Comparison
+
+```{r}
+library(mlr3benchmark)
+library(mlr3extralearners)
+library(mlr3viz)
+
+features_to_use <- c(
+  "growth_12m",
+  "mean_ratio_3m_12m",
+  "acceleration_3m",
+  "acceleration_12m",
+  "volatility_3m",
+  "volatility_12m",
+  "drawdown",
+  "monthly_change",
+  "trend_strength",
+  "acceleration_6m",
+  "volatility_6m"
+)
+
+task <- as_task_regr(features, target = "future_mean_6m", id = "all_trends_raw")
+task$select(features_to_use)
+
+train_ids <- which(features$date < cutoff_date)
+test_ids  <- which(features$date >= cutoff_date & features$date < test_end)
+
+resampling <- rsmp("custom")
+resampling$instantiate(
+  task,
+  train_sets = list(train_ids),
+  test_sets  = list(test_ids)
+)
+
+learners = lrns(c("regr.lm", "regr.kknn", "regr.rpart", "regr.ranger", "regr.xgboost"))
+                                              
+bmr_design <- benchmark_grid(tasks = task, learners = learners, resamplings = resampling)
+
+bmr <- benchmark(design = bmr_design)
+
+autoplot(bmr, measure = msr("regr.rmse"))
+```
+
+Create table with models and their corresponding measures of RMSE, MAE, and R-squared
+```{r}
+bmr_table <- bmr$aggregate(measures = list(msr("regr.rmse"), msr("regr.mae"), msr("regr.rsq"))) %>% as.data.frame() %>% select(learner_id, regr.rmse, regr.mae, regr.rsq)
+
+
+naive_rsq <- function(actual, naive_pred) {
+  1 - sum((actual - naive_pred)^2) / sum((actual - mean(actual))^2)
+}
+
+naive_pred <- test$mean_6m
+naive_actual <- test$future_mean_6m
+
+naive_rmse <- sqrt(mean((naive_actual - naive_pred)^2))
+naive_mae  <- mean(abs(naive_actual - naive_pred))
+naive_r2   <- naive_rsq(naive_actual, naive_pred)
+
+naive_results <- data.frame(
+  learner_id = "naive_no_change",
+  regr.rmse  = naive_rmse,
+  regr.mae   = naive_mae,
+  regr.rsq   = naive_r2
+)
+
+full_comparison <- bind_rows(bmr_table, naive_results) %>%
+  arrange(desc(regr.rsq))
+
+full_comparison
+```
+
+# Level Prediction Falls Short
+
+Against the naive "no change" baseline (rsq = 0.662), the results are mixed. Only XGboost (rsq = 0.735) clearly outperforms naive persistence, only adding about 0.07 rsq. This finding motivates the shift to a different framing of the problem in the next section. Predicting the direction of change (up or down) turned out to reveal substantially more consistent signal across nearly every model.
+
+# Predicting The Direction Of Change 
+
+Again, we will split by time to avoid look-ahead bias
+```{r}
+# Split the training and test data
+set.seed(123)
+
+cutoff_date <- as.Date("2025-01-01")
+test_end <- as.Date("2026-06-01")
+
+train <- features %>% filter(date < cutoff_date)
+test <- features %>% filter(date >= cutoff_date & date < test_end)
+
+```
+
+## Ranger 
+```{r}
+library(ranger)
+library(mlr3)
+library(mlr3learners)
+
+features_to_use <- c(
+  "growth_12m",
+  "mean_ratio_3m_12m",
+  "acceleration_3m",
+  "acceleration_12m",
+  "volatility_3m",
+  "volatility_12m",
+  "drawdown",
+  "monthly_change",
+  "trend_strength",
+  "acceleration_6m",
+  "volatility_6m"
+)
+
+task <- as_task_classif(train, target = "direction", id = "all_trends_raw")
+
+task$select(features_to_use)
+
+learner_ranger <- lrn("classif.ranger", predict_type = "prob", importance = "impurity")
+
+learner_ranger$train(task)
+
+learner_ranger$importance()
+
+prediction_ranger <- learner_ranger$predict_newdata(test)
+```
+
+```{r}
+results_direction <- test %>%
+  select(keyword, date, hits, mean_6m, future_mean_6m, direction) %>%
+  mutate(
+    predicted_direction = prediction_ranger$response,
+    prob_up = prediction_ranger$prob[, "1"],
+    correct = predicted_direction == direction,
+    actual_growth_pct = ifelse(hits <= epsilon, NA, ((future_mean_6m / hits) - 1) * 100)
+  ) %>%
+  arrange(desc(prob_up))
+
+head(results_direction)
+```
+
+```{r}
+prediction_ranger$score(msrs(c("classif.acc","classif.bacc","classif.auc", "classif.precision", "classif.recall", "classif.bbrier")))
+```
+
+
+
+## XGboost
+```{r}
+library(xgboost)
+library(mlr3)
+library(mlr3learners)
+
+features_to_use <- c(
+  "growth_12m",
+  "mean_ratio_3m_12m",
+  "acceleration_3m",
+  "acceleration_12m",
+  "volatility_3m",
+  "volatility_6m",
+  "volatility_12m",
+  "drawdown",
+  "monthly_change",
+  "trend_strength",
+  "acceleration_6m"
+)
+
+task <- as_task_classif(train, target = "direction", id = "all_trends_raw")
+
+task$select(features_to_use)
+
+learner_xgboost <- lrn("classif.xgboost", predict_type = "prob")
+
+
+learner_xgboost$train(task)
+
+prediction_xgboost <- learner_xgboost$predict_newdata(test)
+
+learner_xgboost$importance()
+
+
+```
+
+```{r}
+prediction_xgboost$score(msrs(c("classif.acc","classif.bacc","classif.auc", "classif.precision", "classif.recall", "classif.bbrier")))
+```
+
+```{r}
+prediction_direction <- learner_xgboost$predict_newdata(test)  
+
+results_direction <- test %>%
+  select(keyword, date, hits, mean_6m, future_mean_6m, direction) %>%
+  mutate(
+    predicted_direction = prediction_direction$response,
+    prob_up = prediction_direction$prob[, "1"],
+    correct = predicted_direction == direction,
+    actual_growth_pct = ifelse(hits <= epsilon, NA, ((future_mean_6m / hits) - 1) * 100)
+  ) %>%
+  arrange(desc(prob_up))
+
+head(results_direction)
+```
+
+# Direction Classification: Model Comparison
+
+```{r}
+library(mlr3benchmark)
+library(mlr3extralearners)
+library(mlr3viz)
+
+features_to_use <- c(
+  "growth_12m",
+  "mean_ratio_3m_12m",
+  "acceleration_3m",
+  "acceleration_12m",
+  "volatility_3m",
+  "volatility_12m",
+  "drawdown",
+  "monthly_change",
+  "trend_strength",
+  "acceleration_6m",
+  "volatility_6m"
+)
+
+task <- as_task_classif(features, target = "direction", id = "all_trends_raw")
+task$select(features_to_use)
+
+train_ids <- which(features$date < cutoff_date)
+test_ids  <- which(features$date >= cutoff_date & features$date < test_end)
+
+resampling <- rsmp("custom")
+resampling$instantiate(
+  task,
+  train_sets = list(train_ids),
+  test_sets  = list(test_ids)
+)
+
+learners = lrns(c("classif.featureless", "classif.log_reg", "classif.kknn", "classif.rpart", "classif.ranger", "classif.xgboost"), predict_type = "prob")
+                                              
+bmr_design <- benchmark_grid(tasks = task, learners = learners, resamplings = resampling)
+
+bmr <- benchmark(design = bmr_design)
+bmr$aggregate(measures = list(
+  msr("classif.acc"),
+  msr("classif.bacc"),
+  msr("classif.auc"),
+  msr("classif.bbrier"),
+  msr("classif.precision"),
+  msr("classif.recall")
+))
+
+autoplot(bmr, measure = msr("classif.auc"))
+```
+
+
+# Conclusion
+
+This project asked a simple question: can Google search interest data anticipate which foods are about to grow in popularity? The answer is dependent on how the question is framed.
+
+Predicting the exact future level of search interest proved to be a difficult problem. A naive model that simply assumed each keyword's recent search volume would continue unchanged explained a large share of the variance (R-squared = 0.662). Of the models tested, only XGboost clearly improved on this baseline (R-squared = 0.735). Ranger offered a marginal gain, and the simpler models performed worse than this naive model.
+
+Reframing the initial problem as a binary question (will this keyword's search interest be higher or lower six months from now?), produced a substantially stronger and more consistent result. Against a naive baseline of always guessing the majority class (accuracy = 0.631, AUC = 0.500), the best-performing model (ranger) reached an accuracy of 0.757 and an AUC of 0.861, which is a significant improvement over every model tested. This suggests that while the exact magnitude of future search interest is hard to predict, the direction of change carries real, learnable signal.
+
+Limitations:
+
+There are a couple of limitations to this analysis. To start, Google search interest is a proxy for food popularity, rather than a pure measure of how much of that food is consumed. An increase in searches is not a direct connection to a food being consumed more. Also, I did not do any hyperparameter tuning; Ranger and XGBoost were run with default settings. Additionally, the analysis only uses U.S Google search data, so the results are only able to be generalized to Americans. Lastly, results are based on one time-based split (train through 2024, test on 2025–mid-2026). This could potentially give a nosier estimate of performance; a rolling-origin validation across multiple cutoff dates would give a more reliable sense of how stable the 0.86 AUC actually is across different time windows.
+
+Future work: 
+
+Future work could focus on improving the model's ability to identify emerging food trends by incorporating additional predictors. In particular, accounting for seasonality more explicitly could help distinguish recurring seasonal increases in search interest from genuine emerging trends.
+
+
+
+
