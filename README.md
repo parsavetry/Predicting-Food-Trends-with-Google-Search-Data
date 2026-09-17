@@ -190,20 +190,6 @@ R
 - Project Structure
 - PredictingFoodTrends/
 
-## Project Structure
-  
-```text
-├── data/
-│   └── food_trends_raw.rds
-│
-├── trends_raw_cache/
-│   └── *.rds
-│
-├── PredictingFoodTrends.Rmd
-├── PredictingFoodTrends.pdf
-└── README.md
-```
-
 ## Limitations
 
 There are several important limitations to this analysis:
